@@ -10,7 +10,7 @@ SERIAL_PORT = 'COM4'
 BAUD_RATE = 115200
 FS = 48000
 N = 2048
-DEVICE_INDEX = 9
+DEVICE_INDEX = 5
 FREQ_MIN, FREQ_MAX = 300, 15000
 NUM_BINS = 16
 
@@ -26,13 +26,13 @@ OTHER_BINS = [i for i in range(NUM_BINS) if i not in DRONE_BINS]
 LAST_SEND_TIME = time.time()
 
 # NEW: Tuning variables for sensitivity
-SNR_MIN = 1.05  # Ratio where confidence starts climbing above 0%
-SNR_MAX = 1.30  # Ratio where confidence hits 100% (Lower = more sensitive)
+SNR_MIN = 0.2364  # Ratio where confidence starts climbing above 0%
+SNR_MAX = 0.2664  # Ratio where confidence hits 100% (Lower = more sensitive)
 
 
 
 # Generate weights for the 5-second window (Linear ramp: recent = higher weight)
-time_weights = np.linspace(0.1, 1.0, WINDOW_FRAMES)
+time_weights = np.linspace(0.0100, 1.0, WINDOW_FRAMES)  # Run optimizer.py to auto-tune this start value per hardware
 time_weights = time_weights / np.sum(time_weights) # Normalize to sum to 1.0
 
 # Data Buffer
@@ -47,20 +47,27 @@ except Exception as e:
     ser = None
 
 def calculate_confidence(history_window):
-    """Calculates a 0-100% confidence score based on the 5-second window."""
+    """Calculates a 0-100% confidence score based on the 5-second window.
+
+    Run optimizer.py to auto-tune SNR_MIN, SNR_MAX, silence gate, and weight_start
+    for your specific hardware (speaker-mics have different frequency response curves):
+        python optimizer.py --audio your_drone_clip.mp3
+    The optimizer uses simulated annealing over 3000 iterations, auto-segments the
+    clip into drone vs. silence windows, and outputs exact values to paste back here.
+    """
     confidences = np.zeros(WINDOW_FRAMES)
-    
+
     for i in range(WINDOW_FRAMES):
         frame = history_window[i]
-        
+
         # 1. Target Magnitude (Try taking the MAX instead of the average to be more sensitive)
         target_mag = np.max([frame[DRONE_BINS[0]], frame[DRONE_BINS[1]]])
-        
-        # 2. Highest Noise Magnitude 
-        noise_mag = np.max(frame[OTHER_BINS])
-        
-        # 3. Absolute Silence Check 
-        if target_mag < 15.0: 
+
+        # 2. Mean Noise Magnitude (mean avoids loud low-freq bins dominating the ratio)
+        noise_mag = float(np.mean([frame[j] for j in OTHER_BINS]))
+
+        # 3. Absolute Silence Check
+        if target_mag < 9.13:
             confidences[i] = 0.0
             continue
             
@@ -86,7 +93,7 @@ def calculate_confidence(history_window):
 # --- Audio Logic ---
 def callback(indata, frames, time_info, status):
     global fft_history, LAST_SEND_TIME
-    
+
     audio = indata[:, 0] * np.hanning(len(indata))
     fft_data = np.abs(np.fft.rfft(audio))
     
