@@ -4,137 +4,177 @@ import serial
 import time
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import pickle
+import os
 
 # --- Configuration ---
-SERIAL_PORT = 'COM4' 
+SERIAL_PORT = 'COM4'
 BAUD_RATE = 115200
 FS = 48000
 N = 2048
 DEVICE_INDEX = 9
 FREQ_MIN, FREQ_MAX = 300, 15000
 NUM_BINS = 16
+FEATURE_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0, 1.0, 1.2, 1.5, 1.5, 1.2, 1.0, 1.0])
 
 HISTORY_SECONDS = 10
-UPDATES_PER_SEC = 20 
+UPDATES_PER_SEC = 20
 HISTORY_LEN = UPDATES_PER_SEC * HISTORY_SECONDS
 
 # --- Algorithm Configuration ---
-WINDOW_SEC = 5
+WINDOW_SEC    = 5
 WINDOW_FRAMES = int(WINDOW_SEC * UPDATES_PER_SEC)
-DRONE_BINS = [10, 11]       # ZERO INDEXED
-OTHER_BINS = [i for i in range(NUM_BINS) if i not in DRONE_BINS]
+DRONE_BINS    = [10, 11]
+OTHER_BINS    = [i for i in range(NUM_BINS) if i not in DRONE_BINS]
 LAST_SEND_TIME = time.time()
 
-# NEW: Tuning variables for sensitivity
-SNR_MIN = 1.05  # Ratio where confidence starts climbing above 0%
-SNR_MAX = 1.30  # Ratio where confidence hits 100% (Lower = more sensitive)
+# Time weights — still used to smooth the classifier's per-frame probabilities
+time_weights = np.linspace(0.5, 1.0, WINDOW_FRAMES)
+time_weights = time_weights / np.sum(time_weights)
 
-
-
-# Generate weights for the 5-second window (Linear ramp: recent = higher weight)
-time_weights = np.linspace(0.1, 1.0, WINDOW_FRAMES)
-time_weights = time_weights / np.sum(time_weights) # Normalize to sum to 1.0
-
-# Data Buffer
+# Data buffer
 fft_history = np.ones((HISTORY_LEN, NUM_BINS)) * 0.1
 
-# --- Serial Setup ---
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-    print(f"Connected to {SERIAL_PORT}")
-except Exception as e:
-    print(f"Serial Error: {e}. Running in Plot-Only mode.")
-    ser = None
+# --- Load classifier ---
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'drone_model.pkl')
+classifier = None
 
-def calculate_confidence(history_window):
-    """Calculates a 0-100% confidence score based on the 5-second window."""
-    confidences = np.zeros(WINDOW_FRAMES)
+if os.path.exists(MODEL_PATH):
+    try:
+        with open(MODEL_PATH, 'rb') as f:
+            classifier = pickle.load(f)
+        print(f"Loaded classifier from {MODEL_PATH}")
+    except Exception as e:
+        print(f"Warning: could not load model ({e}). Falling back to ratio method.")
+else:
+    print(f"Warning: drone_model.pkl not found. Falling back to ratio method.")
+    print(f"Run: python train_model.py --drone drone.wav --background bg.wav")
+
+
+# --- Serial Setup ---
+# try:
+#     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+#     print(f"Connected to {SERIAL_PORT}")
+# except Exception as e:
+#     print(f"Serial Error: {e}. Running in Plot-Only mode.")
+ser = None
+
+
+# --- Feature extraction (must match train_model.py exactly) ---
+def frame_to_features(frame: np.ndarray) -> np.ndarray:
+    """
+    Converts one frame of 16 bins into the 33-feature vector
+    that the classifier was trained on.
+    """
+    arr         = np.array(frame)
+    # Apply high-frequency focus weights
+    arr         = arr * FEATURE_WEIGHTS
     
+    diff        = np.diff(arr).tolist()
+    high_energy = float(np.mean(arr[4:]))
+    spread      = float(np.std(arr))
+    return np.array(arr.tolist() + diff + [high_energy, spread])
+
+
+# --- Confidence calculation ---
+def calculate_confidence(history_window: np.ndarray) -> float:
+    """
+    If a trained classifier is available: runs each frame through the
+    Random Forest and returns a time-weighted average of per-frame
+    drone probabilities (0-100%).
+
+    Falls back to the original ratio method if no model is loaded.
+    """
+    if classifier is not None:
+        # ML path: get per-frame drone probability, then weighted average
+        features      = np.array([frame_to_features(history_window[i])
+                                   for i in range(WINDOW_FRAMES)])
+        probs         = classifier.predict_proba(features)[:, 1]   # drone probability
+        final         = float(np.sum(probs * time_weights) * 100)
+        
+        # Soft-cutoff to reduce false positives
+        if final < 77.0:
+            final = final / 2.0
+            
+        return min(100.0, max(0.0, final))
+
+    # Fallback: original ratio method (kept as safety net)
+    SNR_MIN = 1.05
+    SNR_MAX = 1.30
+    confidences = np.zeros(WINDOW_FRAMES)
+
     for i in range(WINDOW_FRAMES):
-        frame = history_window[i]
-        
-        # 1. Target Magnitude (Try taking the MAX instead of the average to be more sensitive)
+        frame      = history_window[i]
         target_mag = np.max([frame[DRONE_BINS[0]], frame[DRONE_BINS[1]]])
-        
-        # 2. Highest Noise Magnitude 
-        noise_mag = np.max(frame[OTHER_BINS])
-        
-        # 3. Absolute Silence Check 
-        if target_mag < 15.0: 
+
+        if target_mag < 15.0:
             confidences[i] = 0.0
             continue
-            
-        # 4. Ratio Calculation
-        ratio = target_mag / (noise_mag + 0.1)
-        
-        # 5. Map Ratio to Percentage using the new variables
-        if ratio >= SNR_MAX:       
-            conf = 100.0
-        elif ratio <= SNR_MIN:     
-            conf = 0.0
-        else:                  
-            # Dynamic interpolation based on your variables
-            conf = ((ratio - SNR_MIN) / (SNR_MAX - SNR_MIN)) * 100.0 
-            
-        confidences[i] = conf
 
-    # 6. Apply Time Weights (Weighted Average)
-    final_confidence = np.sum(confidences * time_weights)
-    return final_confidence
+        noise_mag = np.max(frame[OTHER_BINS])
+        ratio     = target_mag / (noise_mag + 0.1)
+
+        if ratio >= SNR_MAX:
+            confidences[i] = 100.0
+        elif ratio <= SNR_MIN:
+            confidences[i] = 0.0
+        else:
+            confidences[i] = ((ratio - SNR_MIN) / (SNR_MAX - SNR_MIN)) * 100.0
+
+    return float(np.sum(confidences * time_weights))
 
 
-# --- Audio Logic ---
+# --- Audio callback ---
 def callback(indata, frames, time_info, status):
     global fft_history, LAST_SEND_TIME
-    
-    audio = indata[:, 0] * np.hanning(len(indata))
+
+    audio    = indata[:, 0] * np.hanning(len(indata))
     fft_data = np.abs(np.fft.rfft(audio))
-    
-    idx_min = int(FREQ_MIN * N / FS)
-    idx_max = int(FREQ_MAX * N / FS)
+
+    idx_min     = int(FREQ_MIN * N / FS)
+    idx_max     = int(FREQ_MAX * N / FS)
     focused_fft = fft_data[idx_min:idx_max]
-    
-    if len(focused_fft) < NUM_BINS: return
-        
-    bins = np.array_split(focused_fft, NUM_BINS)
+
+    if len(focused_fft) < NUM_BINS:
+        return
+
+    bins     = np.array_split(focused_fft, NUM_BINS)
     features = [float(np.log1p(np.mean(b)) * 100) for b in bins]
 
-    # Shift history and add new data
     fft_history = np.roll(fft_history, -1, axis=0)
     fft_history[-1, :] = features
 
-    # --- TRANSMISSION LOGIC (1 Hz) ---
+    # Transmit at 1 Hz
     current_time = time.time()
     if current_time - LAST_SEND_TIME >= 1.0:
         LAST_SEND_TIME = current_time
-        
-        # Grab only the last 5 seconds of data for the algorithm
+
         recent_window = fft_history[-WINDOW_FRAMES:]
-        confidence = calculate_confidence(recent_window)
-        
-        # Format explicitly to 2 decimal places with a > header
+        confidence    = calculate_confidence(recent_window)
+
         msg = f">{confidence:.2f}\n"
-        
         if ser:
             ser.write(msg.encode())
-            
-        # Print to terminal alongside the plot so you can verify it's working
-        print(f"Drone Confidence: {confidence:.2f}%")
 
-# --- Plotting Logic ---
+        print(f"Drone Confidence: {confidence:.2f}%  "
+              f"{'[MODEL]' if classifier else '[RATIO]'}")
+
+
+# --- Plotting ---
 fig, ax = plt.subplots(figsize=(12, 6))
-im = ax.imshow(fft_history.T, aspect='auto', origin='lower', 
+im = ax.imshow(fft_history.T, aspect='auto', origin='lower',
                cmap='magma', extent=[-HISTORY_SECONDS, 0, 0, NUM_BINS],
                vmin=0, vmax=500)
 
-ax.set_title("Live Spectrogram & Background Detection")
+ax.set_title("VantagePoint — Live Spectrogram"
+             + (" (ML classifier active)" if classifier else " (ratio fallback)"))
 ax.set_xlabel("Seconds Ago")
 ax.set_ylabel("Frequency Bin (10 & 11 are Target)")
 plt.colorbar(im, label="Log Magnitude")
 
-# Draw horizontal lines to visually highlight the target bins on the plot
 ax.axhline(y=10, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
 ax.axhline(y=12, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+
 
 def update_plot(frame):
     im.set_array(fft_history.T)
@@ -143,11 +183,12 @@ def update_plot(frame):
         im.set_clim(vmin=0, vmax=current_max)
     return [im]
 
-# --- Start Threads ---
-stream = sd.InputStream(device=DEVICE_INDEX, callback=callback, 
+
+# --- Start ---
+stream = sd.InputStream(device=DEVICE_INDEX, callback=callback,
                         samplerate=FS, blocksize=N, channels=1)
 
 with stream:
-    ani = FuncAnimation(fig, update_plot, interval=1000/UPDATES_PER_SEC, 
+    ani = FuncAnimation(fig, update_plot, interval=1000 / UPDATES_PER_SEC,
                         blit=True, cache_frame_data=False)
     plt.show()
