@@ -4,8 +4,10 @@ import serial
 import time
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-import pickle
 import os
+
+import torch
+import torch.nn as nn
 
 # --- Configuration ---
 SERIAL_PORT = 'COM4'
@@ -15,7 +17,8 @@ N = 2048
 DEVICE_INDEX = 9
 FREQ_MIN, FREQ_MAX = 300, 15000
 NUM_BINS = 16
-FEATURE_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0, 1.0, 1.2, 1.5, 1.5, 1.2, 1.0, 1.0])
+FEATURE_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0,
+                             1.0, 1.0, 1.2, 1.5, 1.5, 1.2, 1.0, 1.0])
 
 HISTORY_SECONDS = 10
 UPDATES_PER_SEC = 20
@@ -28,27 +31,67 @@ DRONE_BINS    = [10, 11]
 OTHER_BINS    = [i for i in range(NUM_BINS) if i not in DRONE_BINS]
 LAST_SEND_TIME = time.time()
 
-# Time weights — still used to smooth the classifier's per-frame probabilities
+# Time weights — smooths classifier per-frame probabilities
 time_weights = np.linspace(0.5, 1.0, WINDOW_FRAMES)
 time_weights = time_weights / np.sum(time_weights)
 
 # Data buffer
 fft_history = np.ones((HISTORY_LEN, NUM_BINS)) * 0.1
 
+
+# ── DroneNet model definition (must match train_model.py) ─────────────────────
+class DroneNet(nn.Module):
+    """
+    4-layer MLP with Batch Normalization and Dropout.
+      Input:  33 features
+      Output: 1 logit (sigmoid → drone probability)
+    """
+    def __init__(self, input_dim: int = 33):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(32, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
 # --- Load classifier ---
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'drone_model.pkl')
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drone_model.pth')
 classifier = None
+norm_mean  = None
+norm_std   = None
 
 if os.path.exists(MODEL_PATH):
     try:
-        with open(MODEL_PATH, 'rb') as f:
-            classifier = pickle.load(f)
-        print(f"Loaded classifier from {MODEL_PATH}")
+        checkpoint  = torch.load(MODEL_PATH, map_location='cpu', weights_only=False)
+        input_dim   = checkpoint.get('input_dim', 33)
+        classifier  = DroneNet(input_dim=input_dim)
+        classifier.load_state_dict(checkpoint['model_state'])
+        classifier.eval()   # inference mode — disables dropout
+        norm_mean = checkpoint['mean'].astype(np.float32)
+        norm_std  = checkpoint['std'].astype(np.float32)
+        print(f"Loaded DroneNet from {MODEL_PATH}")
     except Exception as e:
         print(f"Warning: could not load model ({e}). Falling back to ratio method.")
 else:
-    print(f"Warning: drone_model.pkl not found. Falling back to ratio method.")
-    print(f"Run: python train_model.py --drone drone.wav --background bg.wav")
+    print(f"Warning: drone_model.pth not found. Falling back to ratio method.")
+    print(f"Run: python train_model.py --drone drone_data/ --background background_data/")
 
 
 # --- Serial Setup ---
@@ -66,36 +109,44 @@ def frame_to_features(frame: np.ndarray) -> np.ndarray:
     Converts one frame of 16 bins into the 33-feature vector
     that the classifier was trained on.
     """
-    arr         = np.array(frame)
+    arr         = np.array(frame, dtype=np.float32)
     # Apply high-frequency focus weights
     arr         = arr * FEATURE_WEIGHTS
-    
+
     diff        = np.diff(arr).tolist()
     high_energy = float(np.mean(arr[4:]))
     spread      = float(np.std(arr))
-    return np.array(arr.tolist() + diff + [high_energy, spread])
+    return np.array(arr.tolist() + diff + [high_energy, spread], dtype=np.float32)
 
 
 # --- Confidence calculation ---
 def calculate_confidence(history_window: np.ndarray) -> float:
     """
-    If a trained classifier is available: runs each frame through the
-    Random Forest and returns a time-weighted average of per-frame
-    drone probabilities (0-100%).
+    If a trained DroneNet is available: runs each frame through the MLP
+    and returns a time-weighted average of per-frame drone probabilities (0–100%).
 
     Falls back to the original ratio method if no model is loaded.
     """
     if classifier is not None:
-        # ML path: get per-frame drone probability, then weighted average
-        features      = np.array([frame_to_features(history_window[i])
-                                   for i in range(WINDOW_FRAMES)])
-        probs         = classifier.predict_proba(features)[:, 1]   # drone probability
-        final         = float(np.sum(probs * time_weights) * 100)
-        
-        # Soft-cutoff to reduce false positives
+        # Build feature matrix: (WINDOW_FRAMES, 33)
+        features = np.array([frame_to_features(history_window[i])
+                              for i in range(WINDOW_FRAMES)])
+
+        # Normalize using training-set statistics
+        features = (features - norm_mean) / norm_std
+
+        tensor = torch.from_numpy(features)   # shape (W, 33)
+
+        with torch.no_grad():
+            logits = classifier(tensor)           # shape (W,)
+            probs  = torch.sigmoid(logits).numpy()
+
+        final = float(np.sum(probs * time_weights) * 100)
+
+        # Soft-cutoff: suppress uncertain predictions
         if final < 77.0:
             final = final / 2.0
-            
+
         return min(100.0, max(0.0, final))
 
     # Fallback: original ratio method (kept as safety net)
@@ -157,7 +208,7 @@ def callback(indata, frames, time_info, status):
             ser.write(msg.encode())
 
         print(f"Drone Confidence: {confidence:.2f}%  "
-              f"{'[MODEL]' if classifier else '[RATIO]'}")
+              f"{'[DRONENET]' if classifier else '[RATIO]'}")
 
 
 # --- Plotting ---
@@ -167,7 +218,7 @@ im = ax.imshow(fft_history.T, aspect='auto', origin='lower',
                vmin=0, vmax=500)
 
 ax.set_title("VantagePoint — Live Spectrogram"
-             + (" (ML classifier active)" if classifier else " (ratio fallback)"))
+             + (" (DroneNet MLP active)" if classifier else " (ratio fallback)"))
 ax.set_xlabel("Seconds Ago")
 ax.set_ylabel("Frequency Bin (10 & 11 are Target)")
 plt.colorbar(im, label="Log Magnitude")
