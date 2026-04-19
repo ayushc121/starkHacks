@@ -1,11 +1,17 @@
 #include <Arduino.h>
 #include <math.h>
+#include <TM1637.h>
 
 // ===== CONFIG =====
 #define ADC_PIN 36
 #define FFT_SIZE 16
 #define SAMPLE_RATE 4000  // Hz (adjust as needed)
 #define SMOOTH_WINDOW 4
+
+#define CLK = 42;
+#define DIO = 41;
+TM1637 tm(CLK, DIO); 
+
 
 // ===== GLOBALS =====
 float samples[FFT_SIZE];
@@ -139,6 +145,30 @@ void loop() {
     // Neural Network
     confidence = runNN(magnitudes);
 
+    int roundedValue = (int)(confidence + 0.5);
+
+    // DISPLAY AND UI 
+    // 2. Constrain between 0 and 100
+     if (roundedValue > 100) roundedValue = 100;
+    if (roundedValue < 0)   roundedValue = 0;
+
+    // 3. Clear the display first to prevent "ghost" digits 
+    tm.clearScreen();
+
+    uint8_t offset = 0;
+    if (roundedValue < 10) offset = 3;      // Single digit (Position 4)
+    else if (roundedValue < 100) offset = 2; // Two digits (Position 3 & 4)
+    else offset = 1;                         // "100" (Position 2, 3 & 4)
+
+    tm.display(roundedValue, false, false, offset);    
+
+    if (confidence >= DETECTION_THRESHOLD) {
+        neopixelWrite(LED_PIN, 255, 0, 0); 
+      } 
+    else {
+        neopixelWrite(LED_PIN, 0, 100, 0);  
+      }
+    
     // ===== SERIAL OUTPUT =====
     // Format: FFT values comma-separated
     for (int i = 0; i < FFT_SIZE; i++) {
